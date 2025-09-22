@@ -1,0 +1,703 @@
+// mcp_server_incident_management.js
+require('dotenv').config();
+const express = require('express');
+const { MongoClient, ObjectId } = require('mongodb');
+const axios = require('axios');
+
+// Configuration from environment variables
+const MONGO_URL = process.env.MONGO_URL;
+const DB_NAME = process.env.DB_NAME || "incident_management";
+const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
+const PORT = process.env.PORT || 8001;
+const HOST = process.env.HOST || '0.0.0.0';
+
+// Store current call session info
+const currentCallSession = {};
+
+// MongoDB connection
+let client;
+let db = null;
+
+async function connectMongoDB() {
+    try {
+        client = new MongoClient(MONGO_URL, {
+            ssl: true,
+            tlsAllowInvalidCertificates: true
+        });
+        await client.connect();
+        db = client.db(DB_NAME);
+        // Test connection
+        await db.admin().ping();
+        console.log(`✅ MongoDB connected to ${DB_NAME}`);
+    } catch (error) {
+        console.error(`❌ MongoDB error: ${error}`);
+        db = null;
+    }
+}
+
+function generateTicketReference() {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const random = Math.floor(Math.random() * 9000) + 1000;
+    return `INC${year}${month}${day}${random}`;
+}
+
+async function findUserByPhone(phone) {
+    /**Find user by phone number with multiple format matching*/
+    if (!phone) {
+        return null;
+    }
+
+    // Clean phone number
+    const cleanPhone = phone.replace(/\+91/g, '').replace(/\+/g, '').replace(/\s/g, '').replace(/-/g, '');
+
+    // Try different phone number formats
+    const phonePatterns = [
+        phone,  // Original format
+        `+91${cleanPhone}`,  // With +91
+        `91${cleanPhone}`,   // With 91 prefix
+        cleanPhone,  // Without country code
+        `+${cleanPhone}`,  // With + but no country code
+    ];
+
+    console.log(`🔍 Searching for user with phone patterns: ${JSON.stringify(phonePatterns)}`);
+
+    // If MongoDB is not available, return mock user for testing
+    if (!db) {
+        return {
+            "_id": new ObjectId(),
+            "full_name": "Test User",
+            "phone": phone,
+            "email": "test@example.com",
+            "role": "support_agent"
+        };
+    }
+
+    try {
+        for (const pattern of phonePatterns) {
+            const user = await db.collection('users').findOne({"phone": pattern});
+            if (user) {
+                console.log(`👤 Found user: ${user.full_name} with phone: ${user.phone}`);
+                return user;
+            }
+        }
+
+        console.log(`❌ No user found for phone: ${phone}`);
+        return null;
+    } catch (error) {
+        console.error(`❌ Error finding user: ${error}`);
+        return null;
+    }
+}
+
+// Store call context endpoint (called by ElevenLabs when call starts)
+async function storeCallContext(req, res) {
+    /**Store the calling number and incident context for this session*/
+    try {
+        const data = req.body;
+        const callerNumber = data.to_number;  // The number being called to
+        const callId = data.call_id || 'default';
+
+        // Extract incident context from the request
+        const incidentContext = {
+            incident_number: data.incident_number,
+            incident_description: data.incident_description,
+            priority: data.priority,
+            assignment_group: data.assignment_group,
+            state: data.state,
+            created_on: data.created_on,
+            short_description: data.short_description
+        };
+
+        if (callerNumber) {
+            // Find user by the number being called
+            const user = await findUserByPhone(callerNumber);
+            if (user) {
+                currentCallSession[callId] = {
+                    'user': user,
+                    'caller_number': callerNumber,
+                    'incident': incidentContext
+                };
+                console.log(`📞 Call session stored for ${user.full_name} (${callerNumber})`);
+                if (incidentContext.incident_number) {
+                    console.log(`🎫 Incident context: ${incidentContext.incident_number} - ${incidentContext.short_description}`);
+                }
+            }
+        }
+
+        res.json({"status": "success"});
+    } catch (error) {
+        console.error(`❌ Error storing call context: ${error}`);
+        res.json({"status": "error"});
+    }
+}
+
+// MCP Protocol Handler
+async function handleMcpRequest(req, res) {
+    /**Handle MCP JSON-RPC requests*/
+    try {
+        const body = req.body;
+        if (!body) {
+            return res.status(400).json({
+                "jsonrpc": "2.0",
+                "error": {"code": -32700, "message": "Parse error"}
+            });
+        }
+
+        const message = body;
+        console.log(`📨 MCP Request: ${JSON.stringify(message)}`);
+
+        const method = message.method;
+        const msgId = message.id;
+        const params = message.params || {};
+
+        let response;
+
+        if (method === "initialize") {
+            response = {
+                "jsonrpc": "2.0",
+                "id": msgId,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "tools": {"listChanged": false}
+                    },
+                    "serverInfo": {
+                        "name": "critical-incident-escalation-mcp",
+                        "version": "1.0.0"
+                    }
+                }
+            };
+
+        } else if (method === "tools/list") {
+            const tools = [
+                {
+                    "name": "get_current_incident_context",
+                    "description": "Get the current incident context for this emergency call session",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "call_id": {
+                                "type": "string",
+                                "description": "Call session ID (optional, defaults to 'default')"
+                            }
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "get_incident_status",
+                    "description": "Get detailed status and information for a specific critical incident",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "incident_number": {
+                                "type": "string",
+                                "description": "Incident number (e.g., INC0010001)"
+                            }
+                        },
+                        "required": ["incident_number"]
+                    }
+                },
+                {
+                    "name": "search_incidents",
+                    "description": "Search for similar critical incidents and resolution procedures",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "description": {
+                                "type": "string",
+                                "description": "Critical incident description to find similar cases"
+                            },
+                            "assignment_group": {
+                                "type": "string",
+                                "description": "Assignment group (optional)"
+                            }
+                        },
+                        "required": ["description"]
+                    }
+                },
+                {
+                    "name": "get_sop_document",
+                    "description": "Retrieve step-by-step resolution procedures for critical issues",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "issue_type": {
+                                "type": "string",
+                                "description": "Type of critical issue requiring immediate resolution"
+                            }
+                        },
+                        "required": ["issue_type"]
+                    }
+                },
+                {
+                    "name": "execute_resolution_script",
+                    "description": "Execute automated resolution script for critical incident resolution",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "script_name": {
+                                "type": "string",
+                                "description": "Name of the critical resolution script"
+                            },
+                            "ticket_id": {
+                                "type": "string",
+                                "description": "Critical incident ticket ID"
+                            }
+                        },
+                        "required": ["script_name"]
+                    }
+                }
+            ];
+
+            response = {
+                "jsonrpc": "2.0",
+                "id": msgId,
+                "result": {"tools": tools}
+            };
+
+        } else if (method === "tools/call") {
+            const toolName = params.name;
+            const arguments = params.arguments || {};
+
+            console.log(`🔧 Tool called: ${toolName}`);
+            console.log(`📋 Arguments: ${JSON.stringify(arguments)}`);
+
+            let result;
+            if (toolName === "get_current_incident_context") {
+                result = await getCurrentIncidentContext(arguments);
+            } else if (toolName === "get_incident_status") {
+                result = await getIncidentStatus(arguments);
+            } else if (toolName === "search_incidents") {
+                result = await searchIncidents(arguments);
+            } else if (toolName === "get_sop_document") {
+                result = await getSopDocument(arguments);
+            } else if (toolName === "execute_resolution_script") {
+                result = await executeResolutionScript(arguments);
+            } else {
+                result = {"content": [{"type": "text", "text": "Unknown tool"}]};
+            }
+
+            response = {
+                "jsonrpc": "2.0",
+                "id": msgId,
+                "result": result
+            };
+
+        } else if (method === "notifications/initialized") {
+            response = {"jsonrpc": "2.0", "id": msgId, "result": {}};
+
+        } else {
+            response = {
+                "jsonrpc": "2.0",
+                "id": msgId,
+                "error": {"code": -32601, "message": `Method not found: ${method}`}
+            };
+        }
+
+        console.log(`📤 MCP Response: ${JSON.stringify(response)}`);
+        res.json(response);
+
+    } catch (error) {
+        console.error(`❌ MCP error: ${error}`);
+        res.status(500).json({
+            "jsonrpc": "2.0",
+            "id": req.body?.id || null,
+            "error": {"code": -32603, "message": `Internal error: ${error.toString()}`}
+        });
+    }
+}
+
+async function getCurrentIncidentContext(arguments) {
+    /**Get the current incident context for this emergency call session*/
+    const callId = arguments.call_id || 'default';
+
+    try {
+        const session = currentCallSession[callId];
+
+        if (!session) {
+            return {"content": [{"type": "text", "text": "No active call session found. Please ensure the emergency call context is properly established."}]};
+        }
+
+        const user = session.user;
+        const incident = session.incident;
+
+        let responseText = "🚨 **CURRENT EMERGENCY CALL CONTEXT:**\n\n";
+
+        // User context
+        if (user) {
+            responseText += `👤 **CALLER:** ${user.full_name}\n`;
+            responseText += `📞 **PHONE:** ${user.phone}\n`;
+            responseText += `📧 **EMAIL:** ${user.email}\n`;
+            responseText += `🎭 **ROLE:** ${user.role}\n\n`;
+        }
+
+        // Incident context
+        if (incident && incident.incident_number) {
+            responseText += `🎫 **INCIDENT NUMBER:** ${incident.incident_number}\n`;
+
+            if (incident.short_description) {
+                responseText += `📋 **DESCRIPTION:** ${incident.short_description}\n`;
+            }
+
+            if (incident.priority) {
+                responseText += `⚡ **PRIORITY:** ${incident.priority}\n`;
+            }
+
+            if (incident.state) {
+                responseText += `🎯 **STATUS:** ${incident.state}\n`;
+            }
+
+            if (incident.assignment_group) {
+                responseText += `👥 **ASSIGNED TEAM:** ${incident.assignment_group}\n`;
+            }
+
+            if (incident.created_on) {
+                responseText += `📅 **CREATED:** ${incident.created_on}\n`;
+            }
+
+            responseText += "\n🔄 **EMERGENCY SUPPORT:** This is your selected critical incident. I can provide status updates, resolution procedures, or execute emergency scripts for this incident.";
+        } else {
+            responseText += "⚠️ **NO INCIDENT SELECTED:** No specific incident context found for this call. ";
+            responseText += "Please provide the incident number or select an incident for emergency support.";
+        }
+
+        return {"content": [{"type": "text", "text": responseText}]};
+
+    } catch (error) {
+        console.error(`❌ Error getting current incident context: ${error}`);
+        return {"content": [{"type": "text", "text": "🚨 **ERROR:** Unable to retrieve current incident context. Please try again or provide the incident number manually."}]};
+    }
+}
+
+async function searchIncidents(arguments) {
+    /**Search for similar critical incidents and resolution procedures*/
+    const description = (arguments.description || "").trim();
+    const assignmentGroup = (arguments.assignment_group || "").trim();
+
+    if (!description) {
+        return {"content": [{"type": "text", "text": "Please provide the critical incident description to search for similar cases."}]};
+    }
+
+    try {
+        // Call your incident search API
+        const payload = {
+            "description": description,
+            "assignment_group": assignmentGroup
+        };
+
+        const response = await axios.post(`${BACKEND_URL}/api/search_incidents`, payload, {timeout: 30000});
+
+        if (response.status === 200) {
+            const data = response.data;
+
+            if (data.success && data.similar_incidents) {
+                const similarIncidents = data.similar_incidents;
+                let responseText = `🚨 **CRITICAL ESCALATION:** Found ${similarIncidents.length} similar high-priority incidents:\n\n`;
+
+                for (let i = 0; i < Math.min(2, similarIncidents.length); i++) {
+                    const incident = similarIncidents[i];
+                    responseText += `**${incident.number}** - ${incident.similarity} match\n`;
+                    responseText += `Resolution: ${(incident.resolution || 'Check SOP procedures').substring(0, 150)}...\n`;
+                    responseText += `Team: ${incident.assignment_group}\n\n`;
+                }
+
+                if (data.generated_sop) {
+                    responseText += "📋 **IMMEDIATE ACTIONS AVAILABLE:**\nI have the step-by-step resolution procedure ready. Shall I provide the emergency resolution steps now?";
+                }
+
+                return {"content": [{"type": "text", "text": responseText}]};
+            } else {
+                const responseText = "🚨 **CRITICAL ESCALATION:** No similar incidents found in database. " +
+                                  "This appears to be a unique critical issue requiring immediate investigation by the assigned team.";
+                return {"content": [{"type": "text", "text": responseText}]};
+            }
+        } else {
+            return {"content": [{"type": "text", "text": "🚨 **CRITICAL ESCALATION:** Unable to access incident database. Recommend immediate manual investigation."}]};
+        }
+
+    } catch (error) {
+        console.error(`❌ Critical search error: ${error}`);
+        return {"content": [{"type": "text", "text": "🚨 **CRITICAL ESCALATION:** Technical difficulties accessing incident data. Escalate to senior support immediately."}]};
+    }
+}
+
+async function getIncidentStatus(arguments) {
+    /**Get detailed status for critical incident escalation*/
+    const incidentNumber = (arguments.incident_number || "").trim();
+
+    if (!incidentNumber) {
+        return {"content": [{"type": "text", "text": "Please provide the critical incident number for escalation details."}]};
+    }
+
+    try {
+        // Call ServiceNow search API
+        const response = await axios.post(`${BACKEND_URL}/api/search_servicenow`,
+                                        {"incident_number": incidentNumber},
+                                        {timeout: 15000});
+
+        if (response.status === 200) {
+            const data = response.data;
+            const incidents = data.incidents || [];
+
+            if (incidents.length > 0) {
+                const incident = incidents[0];
+                const priority = (incident.priority || '').toLowerCase();
+
+                // Critical escalation format
+                let responseText = `🚨 **CRITICAL ESCALATION - ${incident.number}**\n\n`;
+                responseText += `⚡ **PRIORITY:** ${incident.priority} - IMMEDIATE ATTENTION REQUIRED\n`;
+                responseText += `📋 **ISSUE:** ${incident.short_description}\n`;
+                responseText += `🎯 **CURRENT STATUS:** ${incident.state}\n`;
+                responseText += `👥 **ASSIGNED TEAM:** ${incident.assignment_group}\n`;
+                responseText += `📅 **CREATED:** ${incident.created_on}\n\n`;
+
+                if (priority.includes('critical') || priority.includes('1')) {
+                    responseText += "🚨 **CRITICAL SLA:** 4 hours maximum resolution time\n";
+                } else if (priority.includes('high') || priority.includes('2')) {
+                    responseText += "⚠️ **HIGH PRIORITY SLA:** 8 hours resolution target\n";
+                }
+
+                if (incident.state.toLowerCase() === 'resolved' || incident.state.toLowerCase() === 'closed') {
+                    responseText += "\n✅ **STATUS UPDATE:** This incident has been resolved. Confirming resolution with user.";
+                } else {
+                    responseText += `\n🔄 **URGENT ACTION REQUIRED:** Incident is ${incident.state} - Team needs immediate response.`;
+                }
+
+                responseText += "\n\nDo you need the resolution procedures or SOP guidance for this critical incident?";
+
+                return {"content": [{"type": "text", "text": responseText}]};
+            } else {
+                return {"content": [{"type": "text", "text": `🚨 **CRITICAL:** Could not locate incident ${incidentNumber} in system. Verify incident number or escalate to senior support.`}]};
+            }
+        } else {
+            return {"content": [{"type": "text", "text": "🚨 **CRITICAL SYSTEM ISSUE:** Cannot access incident database. Escalate to infrastructure team immediately."}]};
+        }
+
+    } catch (error) {
+        console.error(`❌ Critical status check error: ${error}`);
+        return {"content": [{"type": "text", "text": "🚨 **CRITICAL SYSTEM FAILURE:** Database connectivity issues. Immediate escalation to infrastructure required."}]};
+    }
+}
+
+async function getSopDocument(arguments) {
+    /**Get critical resolution procedures for immediate escalation*/
+    const issueType = (arguments.issue_type || "").trim();
+
+    if (!issueType) {
+        return {"content": [{"type": "text", "text": "Please specify the critical issue type for emergency resolution procedures."}]};
+    }
+
+    try {
+        // Search for SOP using the search API
+        const response = await axios.post(`${BACKEND_URL}/api/search_incidents`,
+                                        {"description": issueType},
+                                        {timeout: 30000});
+
+        if (response.status === 200) {
+            const data = response.data;
+
+            if (data.generated_sop) {
+                const sopText = data.generated_sop;
+
+                // Extract critical steps for emergency response
+                const lines = sopText.split('\n');
+                const criticalSteps = [];
+                for (let i = 0; i < Math.min(8, lines.length); i++) { // First 8 lines for critical response
+                    const line = lines[i];
+                    if (line.trim() && (line.toLowerCase().includes('step') || /^[1-5]\./.test(line))) {
+                        criticalSteps.push(line.trim());
+                    }
+                }
+
+                let responseText = `🚨 **EMERGENCY SOP - ${issueType.charAt(0).toUpperCase() + issueType.slice(1)}:**\n\n`;
+                responseText += "⚡ **IMMEDIATE ACTIONS REQUIRED:**\n\n";
+
+                if (criticalSteps.length > 0) {
+                    for (let i = 0; i < Math.min(4, criticalSteps.length); i++) { // Limit to 4 critical steps
+                        responseText += `**${i + 1}.** ${criticalSteps[i]}\n`;
+                    }
+                    responseText += "\n🔄 **NEXT:** Execute these steps immediately and report status.\n";
+                    responseText += "📞 **ESCALATION:** If any step fails, escalate to senior support immediately.";
+                } else {
+                    // Fallback to first critical paragraph
+                    const firstParagraph = sopText.split('\n\n')[0] || "";
+                    responseText += `**CRITICAL PROCEDURE:**\n${firstParagraph.substring(0, 250)}...\n\n`;
+                    responseText += "🔄 **ACTION:** Begin this procedure immediately and monitor progress.";
+                }
+
+                responseText += "\n\nDo you need clarification on any of these critical steps?";
+
+                return {"content": [{"type": "text", "text": responseText}]};
+            } else {
+                return {"content": [{"type": "text", "text": `🚨 **CRITICAL:** No SOP available for '${issueType}'. This requires immediate manual intervention by senior technical team.`}]};
+            }
+        } else {
+            return {"content": [{"type": "text", "text": "🚨 **CRITICAL:** Cannot access SOP database. Escalate to senior support for manual resolution procedures."}]};
+        }
+
+    } catch (error) {
+        console.error(`❌ Critical SOP error: ${error}`);
+        return {"content": [{"type": "text", "text": "🚨 **CRITICAL SYSTEM ISSUE:** SOP system unavailable. Immediate escalation to infrastructure team required."}]};
+    }
+}
+
+async function executeResolutionScript(arguments) {
+    /**Execute critical automated resolution script for emergency response*/
+    const scriptName = (arguments.script_name || "").trim();
+    const ticketId = (arguments.ticket_id || "").trim();
+
+    if (!scriptName) {
+        return {"content": [{"type": "text", "text": "Please specify which critical resolution script to execute for emergency response."}]};
+    }
+
+    try {
+        const payload = {
+            "ticket_id": ticketId || generateTicketReference(),
+            "scripts": [scriptName],
+            "description": `CRITICAL: Emergency script execution - ${scriptName}`,
+            "assignment_group": "Critical Response Team",
+            "priority": "critical"
+        };
+
+        const response = await axios.post(`${BACKEND_URL}/api/execute_scripts`,
+                                        payload,
+                                        {timeout: 60000});
+
+        if (response.status === 200) {
+            const data = response.data;
+
+            if (data.success) {
+                const result = data.result;
+
+                let responseText = `🚨 **CRITICAL SCRIPT EXECUTION - ${scriptName.toUpperCase()}**\n\n`;
+                responseText += `📋 **CRITICAL INCIDENT:** ${result.ticket_id || ticketId}\n`;
+                responseText += `⚡ **EMERGENCY SCRIPT:** ${scriptName}\n\n`;
+
+                if (result.resolution_results) {
+                    for (const res of result.resolution_results) {
+                        const status = res.status;
+                        if (status === 'success') {
+                            responseText += `✅ **EMERGENCY RESOLUTION SUCCESS:**\n${res.resolution}\n\n`;
+                        } else {
+                            responseText += `🚨 **CRITICAL FAILURE:**\n${res.resolution}\n\n`;
+                        }
+
+                        if (res.output) {
+                            // Critical output summary
+                            const outputSummary = res.output.length > 150 ? res.output.substring(0, 150) + "..." : res.output;
+                            responseText += `📊 **SYSTEM OUTPUT:** ${outputSummary}\n\n`;
+                        }
+                    }
+
+                    // Determine next steps
+                    const successCount = result.resolution_results.filter(res => res.status === 'success').length;
+                    if (successCount > 0) {
+                        responseText += "🔄 **NEXT ACTION:** Verify system functionality and confirm resolution with end users.";
+                    } else {
+                        responseText += "🚨 **IMMEDIATE ESCALATION REQUIRED:** Script failed - escalate to senior technical team immediately.";
+                    }
+                } else {
+                    responseText += "⚠️ **SCRIPT STATUS:** Execution completed but no results returned. Manual verification required.";
+                }
+
+                return {"content": [{"type": "text", "text": responseText}]};
+            } else {
+                return {"content": [{"type": "text", "text": `🚨 **CRITICAL SCRIPT FAILURE:** ${data.error || 'Unknown error'} - Immediate manual intervention required.`}]};
+            }
+        } else {
+            return {"content": [{"type": "text", "text": "🚨 **CRITICAL SYSTEM ISSUE:** Cannot execute emergency scripts. Escalate to infrastructure team immediately."}]};
+        }
+
+    } catch (error) {
+        console.error(`❌ Critical script execution error: ${error}`);
+        return {"content": [{"type": "text", "text": "🚨 **CRITICAL SYSTEM FAILURE:** Script execution system unavailable. Manual resolution procedures required immediately."}]};
+    }
+}
+
+// Health check endpoint
+async function healthCheck(req, res) {
+    /**Health check*/
+    try {
+        const healthData = {
+            "status": "healthy",
+            "timestamp": new Date().toISOString(),
+            "backend_url": BACKEND_URL
+        };
+
+        if (db) {
+            const ticketsCount = await db.collection('tickets').countDocuments({});
+            const usersCount = await db.collection('users').countDocuments({});
+            healthData.tickets = ticketsCount;
+            healthData.users = usersCount;
+        }
+
+        res.json(healthData);
+    } catch (error) {
+        res.status(500).json({
+            "status": "unhealthy",
+            "error": error.toString()
+        });
+    }
+}
+
+// Initialize Express app
+const app = express();
+app.use(express.json());
+
+// Routes
+app.post("/", handleMcpRequest);
+app.post("/mcp", handleMcpRequest);
+app.get("/health", healthCheck);
+app.post("/call-context", storeCallContext);
+
+// Environment validation
+function validateEnvironment() {
+    const requiredVars = ['MONGO_URL', 'DB_NAME', 'BACKEND_URL'];
+    const missingVars = requiredVars.filter(varName => !process.env[varName]);
+
+    if (missingVars.length > 0) {
+        console.warn(`⚠️ Missing environment variables: ${missingVars.join(', ')}`);
+        console.warn('📝 Using default values. Consider setting these in .env file');
+    }
+
+    // Log configuration
+    console.log('📋 Configuration:');
+    console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`   MongoDB: ${DB_NAME} database`);
+    console.log(`   Backend: ${BACKEND_URL}`);
+    console.log(`   Server: ${HOST}:${PORT}`);
+}
+
+// Start server
+async function startServer() {
+    validateEnvironment();
+    await connectMongoDB();
+
+    app.listen(PORT, HOST, () => {
+        console.log("🚨 Critical Incident Escalation MCP Server Starting...");
+        console.log("🔗 MCP Endpoint: / and /mcp");
+        console.log("📞 Emergency escalation calls for critical incidents");
+        console.log("⚡ Focus: Critical incident resolution and SOP guidance");
+        console.log(`🔗 Backend URL: ${BACKEND_URL}`);
+        console.log(`🚀 Server running on ${HOST}:${PORT}`);
+    });
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+    console.log('Shutting down gracefully...');
+    if (client) {
+        await client.close();
+    }
+    process.exit(0);
+});
+
+if (require.main === module) {
+    startServer();
+}
+
+module.exports = { app, startServer };
