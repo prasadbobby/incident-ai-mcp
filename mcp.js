@@ -261,22 +261,22 @@ async function handleMcpRequest(req, res) {
 
         } else if (method === "tools/call") {
             const toolName = params.name;
-            const arguments = params.arguments || {};
+            const toolArgs = params.arguments || {};
 
             console.log(`🔧 Tool called: ${toolName}`);
-            console.log(`📋 Arguments: ${JSON.stringify(arguments)}`);
+            console.log(`📋 Arguments: ${JSON.stringify(toolArgs)}`);
 
             let result;
             if (toolName === "get_current_incident_context") {
-                result = await getCurrentIncidentContext(arguments);
+                result = await getCurrentIncidentContext(toolArgs);
             } else if (toolName === "get_incident_status") {
-                result = await getIncidentStatus(arguments);
+                result = await getIncidentStatus(toolArgs);
             } else if (toolName === "search_incidents") {
-                result = await searchIncidents(arguments);
+                result = await searchIncidents(toolArgs);
             } else if (toolName === "get_sop_document") {
-                result = await getSopDocument(arguments);
+                result = await getSopDocument(toolArgs);
             } else if (toolName === "execute_resolution_script") {
-                result = await executeResolutionScript(arguments);
+                result = await executeResolutionScript(toolArgs);
             } else {
                 result = {"content": [{"type": "text", "text": "Unknown tool"}]};
             }
@@ -311,9 +311,9 @@ async function handleMcpRequest(req, res) {
     }
 }
 
-async function getCurrentIncidentContext(arguments) {
+async function getCurrentIncidentContext(toolArgs) {
     /**Get the current incident context for this emergency call session*/
-    const callId = arguments.call_id || 'default';
+    const callId = toolArgs.call_id || 'default';
 
     try {
         const session = currentCallSession[callId];
@@ -373,10 +373,10 @@ async function getCurrentIncidentContext(arguments) {
     }
 }
 
-async function searchIncidents(arguments) {
+async function searchIncidents(toolArgs) {
     /**Search for similar critical incidents and resolution procedures*/
-    const description = (arguments.description || "").trim();
-    const assignmentGroup = (arguments.assignment_group || "").trim();
+    const description = (toolArgs.description || "").trim();
+    const assignmentGroup = (toolArgs.assignment_group || "").trim();
 
     if (!description) {
         return {"content": [{"type": "text", "text": "Please provide the critical incident description to search for similar cases."}]};
@@ -425,9 +425,9 @@ async function searchIncidents(arguments) {
     }
 }
 
-async function getIncidentStatus(arguments) {
+async function getIncidentStatus(toolArgs) {
     /**Get detailed status for critical incident escalation*/
-    const incidentNumber = (arguments.incident_number || "").trim();
+    const incidentNumber = (toolArgs.incident_number || "").trim();
 
     if (!incidentNumber) {
         return {"content": [{"type": "text", "text": "Please provide the critical incident number for escalation details."}]};
@@ -483,9 +483,9 @@ async function getIncidentStatus(arguments) {
     }
 }
 
-async function getSopDocument(arguments) {
+async function getSopDocument(toolArgs) {
     /**Get critical resolution procedures for immediate escalation*/
-    const issueType = (arguments.issue_type || "").trim();
+    const issueType = (toolArgs.issue_type || "").trim();
 
     if (!issueType) {
         return {"content": [{"type": "text", "text": "Please specify the critical issue type for emergency resolution procedures."}]};
@@ -545,10 +545,10 @@ async function getSopDocument(arguments) {
     }
 }
 
-async function executeResolutionScript(arguments) {
+async function executeResolutionScript(toolArgs) {
     /**Execute critical automated resolution script for emergency response*/
-    const scriptName = (arguments.script_name || "").trim();
-    const ticketId = (arguments.ticket_id || "").trim();
+    const scriptName = (toolArgs.script_name || "").trim();
+    const ticketId = (toolArgs.ticket_id || "").trim();
 
     if (!scriptName) {
         return {"content": [{"type": "text", "text": "Please specify which critical resolution script to execute for emergency response."}]};
@@ -629,10 +629,43 @@ async function healthCheck(req, res) {
         };
 
         if (db) {
-            const ticketsCount = await db.collection('tickets').countDocuments({});
-            const usersCount = await db.collection('users').countDocuments({});
-            healthData.tickets = ticketsCount;
-            healthData.users = usersCount;
+            try {
+                // Check multiple possible collection names for tickets/incidents
+                const ticketsCount = await db.collection('tickets').countDocuments({});
+                const incidentsCount = await db.collection('incidents').countDocuments({});
+                const usersCount = await db.collection('users').countDocuments({});
+
+                // List all collections to help debug
+                const collections = await db.listCollections().toArray();
+                const collectionNames = collections.map(col => col.name);
+
+                healthData.database = {
+                    connected: true,
+                    collections: collectionNames,
+                    counts: {
+                        tickets: ticketsCount,
+                        incidents: incidentsCount,
+                        users: usersCount
+                    }
+                };
+
+                // Maintain backward compatibility
+                healthData.tickets = ticketsCount + incidentsCount;
+                healthData.users = usersCount;
+            } catch (dbError) {
+                console.error(`❌ Database query error: ${dbError}`);
+                healthData.database = {
+                    connected: false,
+                    error: dbError.toString()
+                };
+                healthData.tickets = 0;
+                healthData.users = 0;
+            }
+        } else {
+            healthData.database = {
+                connected: false,
+                error: "Database connection not established"
+            };
         }
 
         res.json(healthData);
