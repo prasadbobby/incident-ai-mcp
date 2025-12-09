@@ -1,0 +1,33 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/**/*.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/health",
+      "dest": "/api/health.js"
+    },
+    {
+      "src": "/call-context",
+      "dest": "/api/call-context.js",
+      "methods": ["POST"]
+    },
+    {
+      "src": "/mcp",
+      "dest": "/api/mcp.js",
+      "methods": ["POST"]
+    },
+    {
+      "src": "/",
+      "dest": "/api/mcp.js",
+      "methods": ["POST"]
+    }
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  }
+}
