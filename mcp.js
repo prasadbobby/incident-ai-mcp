@@ -336,19 +336,57 @@ async function getCurrentIncidentContext(toolArgs) {
             }
         }
 
-        // If still no session, try to get latest critical incident for this call
+        // If still no session, automatically get latest incident from database
         if (!session && db) {
+            console.log(`🔍 No call context found, fetching latest incident from database...`);
+
+            // Try to get latest critical incident first
             session = await getLatestCriticalIncidentForCall(callId);
+
+            // If no critical incident, get any recent incident
+            if (!session) {
+                const latestIncident = await getLatestIncidentFromDatabase();
+                if (latestIncident) {
+                    session = { incident: latestIncident };
+                    console.log(`📋 Using latest incident: ${latestIncident.ticket_id || latestIncident.number}`);
+                }
+            }
         }
 
-        if (!session) {
-            return {"content": [{"type": "text", "text": "🚨 **NO ACTIVE CALL CONTEXT:** No emergency call session found. Please ensure the critical incident escalation is properly initiated or provide the incident number manually for immediate assistance."}]};
+        // Always try to provide some incident context
+        if (!session || !session.incident) {
+            // Generate a basic context for the call
+            const basicContext = {
+                number: `ESCALATION-${Date.now()}`,
+                description: "Critical incident escalation call initiated",
+                priority: "High",
+                state: "New",
+                created_on: new Date().toISOString(),
+                short_description: "Emergency support call"
+            };
+
+            session = { incident: basicContext };
+            console.log(`⚠️ No incident found, using basic context for emergency call`);
         }
 
         const user = session.user;
         const incident = session.incident;
 
-        let responseText = "🚨 **LIVE EMERGENCY CALL CONTEXT:**\n\n";
+        // Determine response type based on how incident was found
+        let responseHeader = "🚨 **LIVE EMERGENCY CALL CONTEXT:**\n\n";
+        let contextSource = "";
+
+        if (incident.number && incident.number.startsWith('ESCALATION-')) {
+            responseHeader = "🚨 **EMERGENCY ESCALATION CALL:**\n\n";
+            contextSource = "📞 **CALL TYPE:** General emergency escalation\n";
+        } else if (incident.ticket_id) {
+            responseHeader = "🚨 **LATEST INCIDENT ESCALATION:**\n\n";
+            contextSource = "📋 **CONTEXT:** Latest incident from database\n";
+        } else {
+            contextSource = "📞 **CALL STATUS:** Active incident escalation\n";
+        }
+
+        let responseText = responseHeader + contextSource + "\n";
 
         // User context
         if (user) {
@@ -402,7 +440,15 @@ async function getCurrentIncidentContext(toolArgs) {
                 }
             }
 
-            responseText += "\n🔄 **LIVE EMERGENCY SUPPORT:** I have the current incident data. I can provide real-time status updates, resolution procedures, or execute emergency scripts immediately.";
+            // Add context-specific support message
+            if (incident.number && incident.number.startsWith('ESCALATION-')) {
+                responseText += "\n🔄 **EMERGENCY SUPPORT:** I'm ready to assist with this escalation. I can help find specific incidents, provide resolution procedures, or execute emergency scripts.";
+            } else if (incident.ticket_id) {
+                responseText += "\n🔄 **LIVE INCIDENT SUPPORT:** I have the latest incident from your database. I can provide status updates, resolution procedures, or execute emergency scripts for this incident.";
+                responseText += "\n✅ **DATABASE INTEGRATION:** Using most recent incident data automatically.";
+            } else {
+                responseText += "\n🔄 **LIVE EMERGENCY SUPPORT:** I have the current incident data. I can provide real-time status updates, resolution procedures, or execute emergency scripts immediately.";
+            }
 
             if (liveIncident) {
                 responseText += "\n✅ **REAL-TIME DATA:** Incident information updated from live database.";
@@ -425,11 +471,22 @@ async function fetchLiveIncidentData(incidentNumber) {
     if (!incidentNumber || !db) return null;
 
     try {
-        // Check MongoDB first
-        let incident = await db.collection('tickets').findOne(
-            { number: incidentNumber },
+        // Check MongoDB first - try all possible collection names
+        let incident = await db.collection('processed_incidents').findOne(
+            { $or: [
+                { number: incidentNumber },
+                { ticket_id: incidentNumber },
+                { incident_number: incidentNumber }
+            ]},
             { sort: { updated_on: -1, created_on: -1 } }
         );
+
+        if (!incident) {
+            incident = await db.collection('tickets').findOne(
+                { number: incidentNumber },
+                { sort: { updated_on: -1, created_on: -1 } }
+            );
+        }
 
         if (!incident) {
             incident = await db.collection('incidents').findOne(
@@ -473,14 +530,27 @@ async function getLatestCriticalIncidentForCall(callId) {
     if (!db) return null;
 
     try {
-        // Look for the most recent critical/high priority incidents
-        const criticalIncident = await db.collection('tickets').findOne(
+        // Look for the most recent critical/high priority incidents - check processed_incidents first
+        let criticalIncident = await db.collection('processed_incidents').findOne(
             {
-                priority: { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] },
-                state: { $nin: ['Resolved', 'Closed', 'Cancelled'] }
+                $or: [
+                    { priority: { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] }},
+                    { 'sla_info.priority': { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] }}
+                ],
+                status: { $nin: ['Resolved', 'Closed', 'Cancelled', 'completed'] }
             },
             { sort: { created_on: -1 } }
         );
+
+        if (!criticalIncident) {
+            criticalIncident = await db.collection('tickets').findOne(
+                {
+                    priority: { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] },
+                    state: { $nin: ['Resolved', 'Closed', 'Cancelled'] }
+                },
+                { sort: { created_on: -1 } }
+            );
+        }
 
         if (!criticalIncident) {
             const incident = await db.collection('incidents').findOne(
@@ -496,6 +566,64 @@ async function getLatestCriticalIncidentForCall(callId) {
         return { incident: criticalIncident };
     } catch (error) {
         console.error(`❌ Error getting latest critical incident: ${error}`);
+        return null;
+    }
+}
+
+async function getLatestIncidentFromDatabase() {
+    /**Get the most recent incident from any collection for emergency call context*/
+    if (!db) return null;
+
+    try {
+        console.log(`🔍 Searching for latest incident across all collections...`);
+
+        // Try processed_incidents first (most likely to have data)
+        let latestIncident = await db.collection('processed_incidents').findOne(
+            {},
+            { sort: { processing_timestamp: -1, created_on: -1 } }
+        );
+
+        if (latestIncident) {
+            console.log(`📋 Found incident in processed_incidents: ${latestIncident.ticket_id}`);
+            return {
+                number: latestIncident.ticket_id,
+                ticket_id: latestIncident.ticket_id,
+                description: latestIncident.classification?.category || "Processed incident",
+                priority: latestIncident.sla_info?.priority || "Medium",
+                state: latestIncident.status || "Processed",
+                assignment_group: latestIncident.assigned_poc || "Support Team",
+                created_on: latestIncident.processing_timestamp,
+                short_description: `${latestIncident.classification?.category} incident - ${latestIncident.assigned_poc}`
+            };
+        }
+
+        // Try tickets collection
+        latestIncident = await db.collection('tickets').findOne(
+            {},
+            { sort: { created_on: -1 } }
+        );
+
+        if (latestIncident) {
+            console.log(`📋 Found incident in tickets: ${latestIncident.number}`);
+            return latestIncident;
+        }
+
+        // Try incidents collection
+        latestIncident = await db.collection('incidents').findOne(
+            {},
+            { sort: { created_on: -1 } }
+        );
+
+        if (latestIncident) {
+            console.log(`📋 Found incident in incidents: ${latestIncident.number}`);
+            return latestIncident;
+        }
+
+        console.log(`⚠️ No incidents found in any collection`);
+        return null;
+
+    } catch (error) {
+        console.error(`❌ Error getting latest incident: ${error}`);
         return null;
     }
 }
@@ -783,10 +911,12 @@ async function healthCheck(req, res) {
 
         if (db) {
             try {
-                // Check multiple possible collection names for tickets/incidents
+                // Check actual collection names in your database
+                const processedIncidentsCount = await db.collection('processed_incidents').countDocuments({});
                 const ticketsCount = await db.collection('tickets').countDocuments({});
                 const incidentsCount = await db.collection('incidents').countDocuments({});
                 const usersCount = await db.collection('users').countDocuments({});
+                const generatedSopsCount = await db.collection('generated_sops').countDocuments({});
 
                 // List all collections to help debug
                 const collections = await db.listCollections().toArray();
@@ -796,14 +926,17 @@ async function healthCheck(req, res) {
                     connected: true,
                     collections: collectionNames,
                     counts: {
+                        processed_incidents: processedIncidentsCount,
                         tickets: ticketsCount,
                         incidents: incidentsCount,
-                        users: usersCount
+                        users: usersCount,
+                        generated_sops: generatedSopsCount
                     }
                 };
 
-                // Maintain backward compatibility
-                healthData.tickets = ticketsCount + incidentsCount;
+                // Maintain backward compatibility - count all incident-related collections
+                const totalIncidents = processedIncidentsCount + ticketsCount + incidentsCount;
+                healthData.tickets = totalIncidents;
                 healthData.users = usersCount;
             } catch (dbError) {
                 console.error(`❌ Database query error: ${dbError}`);
