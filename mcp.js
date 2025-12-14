@@ -623,16 +623,38 @@ async function getLatestIncidentFromDatabase() {
         );
 
         if (latestIncident) {
-            console.log(`📋 Found incident in processed_incidents: ${latestIncident.ticket_id}`);
+            // ✅ Smart field mapping - try multiple possible field names
+            const incidentId = latestIncident.ticket_id || latestIncident._id || latestIncident.id ||
+                             latestIncident.number || latestIncident.incident_id ||
+                             `PROC-${Date.now()}`;
+
+            const description = latestIncident.description || latestIncident.short_description ||
+                              latestIncident.classification?.category || latestIncident.category ||
+                              "Processed incident";
+
+            const priority = latestIncident.priority || latestIncident.sla_info?.priority ||
+                           latestIncident.urgency || "Medium";
+
+            const status = latestIncident.status || latestIncident.state ||
+                         latestIncident.incident_state || "Processed";
+
+            const assignedTo = latestIncident.assigned_poc || latestIncident.assigned_to ||
+                             latestIncident.assignment_group || "Support Team";
+
+            const createdDate = latestIncident.processing_timestamp || latestIncident.created_on ||
+                              latestIncident.created_at || latestIncident.timestamp ||
+                              new Date().toISOString();
+
+            console.log(`📋 Found incident in processed_incidents: ${incidentId}`);
             return {
-                number: latestIncident.ticket_id,
-                ticket_id: latestIncident.ticket_id,
-                description: latestIncident.classification?.category || "Processed incident",
-                priority: latestIncident.sla_info?.priority || "Medium",
-                state: latestIncident.status || "Processed",
-                assignment_group: latestIncident.assigned_poc || "Support Team",
-                created_on: latestIncident.processing_timestamp,
-                short_description: `${latestIncident.classification?.category} incident - ${latestIncident.assigned_poc}`
+                number: incidentId,
+                ticket_id: incidentId,
+                description: description,
+                priority: priority,
+                state: status,
+                assignment_group: assignedTo,
+                created_on: createdDate,
+                short_description: `${description.substring(0, 50)} - ${assignedTo}`
             };
         }
 

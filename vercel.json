@@ -12,6 +12,11 @@
       "dest": "/api/health.js"
     },
     {
+      "src": "/debug-incident",
+      "dest": "/api/debug-incident.js",
+      "methods": ["GET"]
+    },
+    {
       "src": "/call-context",
       "dest": "/api/call-context.js",
       "methods": ["POST"]
