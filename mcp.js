@@ -312,64 +312,217 @@ async function handleMcpRequest(req, res) {
 }
 
 async function getCurrentIncidentContext(toolArgs) {
-    /**Get the current incident context for this emergency call session*/
+    /**Get the current incident context with real-time data from database*/
     const callId = toolArgs.call_id || 'default';
 
     try {
-        const session = currentCallSession[callId];
+        // First check in-memory storage for backward compatibility
+        let session = currentCallSession[callId];
+
+        // If not in memory, fetch from database
+        if (!session && db) {
+            const callContext = await db.collection('call_contexts').findOne(
+                { call_id: callId, status: 'active' },
+                { sort: { timestamp: -1 } }
+            );
+
+            if (callContext) {
+                session = {
+                    user: callContext.user,
+                    incident: callContext.incident,
+                    caller_number: callContext.caller_number
+                };
+                console.log(`📞 Retrieved call context from database for call ${callId}`);
+            }
+        }
+
+        // If still no session, try to get latest critical incident for this call
+        if (!session && db) {
+            session = await getLatestCriticalIncidentForCall(callId);
+        }
 
         if (!session) {
-            return {"content": [{"type": "text", "text": "No active call session found. Please ensure the emergency call context is properly established."}]};
+            return {"content": [{"type": "text", "text": "🚨 **NO ACTIVE CALL CONTEXT:** No emergency call session found. Please ensure the critical incident escalation is properly initiated or provide the incident number manually for immediate assistance."}]};
         }
 
         const user = session.user;
         const incident = session.incident;
 
-        let responseText = "🚨 **CURRENT EMERGENCY CALL CONTEXT:**\n\n";
+        let responseText = "🚨 **LIVE EMERGENCY CALL CONTEXT:**\n\n";
 
         // User context
         if (user) {
-            responseText += `👤 **CALLER:** ${user.full_name}\n`;
+            responseText += `👤 **EMERGENCY CONTACT:** ${user.full_name}\n`;
             responseText += `📞 **PHONE:** ${user.phone}\n`;
             responseText += `📧 **EMAIL:** ${user.email}\n`;
             responseText += `🎭 **ROLE:** ${user.role}\n\n`;
         }
 
-        // Incident context
-        if (incident && incident.incident_number) {
-            responseText += `🎫 **INCIDENT NUMBER:** ${incident.incident_number}\n`;
+        // Real-time incident context
+        if (incident) {
+            const incidentNumber = incident.number || incident.incident_number;
 
-            if (incident.short_description) {
-                responseText += `📋 **DESCRIPTION:** ${incident.short_description}\n`;
+            // Fetch latest incident status in real-time
+            const liveIncident = await fetchLiveIncidentData(incidentNumber);
+            const currentIncident = liveIncident || incident;
+
+            responseText += `🎫 **INCIDENT NUMBER:** ${currentIncident.number || incidentNumber}\n`;
+
+            if (currentIncident.short_description) {
+                responseText += `📋 **DESCRIPTION:** ${currentIncident.short_description}\n`;
             }
 
-            if (incident.priority) {
-                responseText += `⚡ **PRIORITY:** ${incident.priority}\n`;
+            if (currentIncident.priority) {
+                const priority = currentIncident.priority;
+                const priorityEmoji = priority.includes('1') || priority.toLowerCase().includes('critical') ? '🚨' : '⚡';
+                responseText += `${priorityEmoji} **PRIORITY:** ${priority}\n`;
             }
 
-            if (incident.state) {
-                responseText += `🎯 **STATUS:** ${incident.state}\n`;
+            if (currentIncident.state) {
+                responseText += `🎯 **CURRENT STATUS:** ${currentIncident.state}\n`;
             }
 
-            if (incident.assignment_group) {
-                responseText += `👥 **ASSIGNED TEAM:** ${incident.assignment_group}\n`;
+            if (currentIncident.assignment_group) {
+                responseText += `👥 **ASSIGNED TEAM:** ${currentIncident.assignment_group}\n`;
             }
 
-            if (incident.created_on) {
-                responseText += `📅 **CREATED:** ${incident.created_on}\n`;
+            if (currentIncident.created_on) {
+                responseText += `📅 **CREATED:** ${currentIncident.created_on}\n`;
             }
 
-            responseText += "\n🔄 **EMERGENCY SUPPORT:** This is your selected critical incident. I can provide status updates, resolution procedures, or execute emergency scripts for this incident.";
+            if (currentIncident.updated_on) {
+                responseText += `🔄 **LAST UPDATE:** ${currentIncident.updated_on}\n`;
+            }
+
+            // Calculate SLA if possible
+            if (currentIncident.priority && currentIncident.created_on) {
+                const slaInfo = calculateSLAStatus(currentIncident);
+                if (slaInfo) {
+                    responseText += `⏰ **SLA STATUS:** ${slaInfo}\n`;
+                }
+            }
+
+            responseText += "\n🔄 **LIVE EMERGENCY SUPPORT:** I have the current incident data. I can provide real-time status updates, resolution procedures, or execute emergency scripts immediately.";
+
+            if (liveIncident) {
+                responseText += "\n✅ **REAL-TIME DATA:** Incident information updated from live database.";
+            }
         } else {
-            responseText += "⚠️ **NO INCIDENT SELECTED:** No specific incident context found for this call. ";
-            responseText += "Please provide the incident number or select an incident for emergency support.";
+            responseText += "⚠️ **NO INCIDENT CONTEXT:** No specific incident found for this emergency call. ";
+            responseText += "I can help you find critical incidents or provide the incident number for immediate escalation support.";
         }
 
         return {"content": [{"type": "text", "text": responseText}]};
 
     } catch (error) {
         console.error(`❌ Error getting current incident context: ${error}`);
-        return {"content": [{"type": "text", "text": "🚨 **ERROR:** Unable to retrieve current incident context. Please try again or provide the incident number manually."}]};
+        return {"content": [{"type": "text", "text": "🚨 **EMERGENCY SYSTEM ERROR:** Unable to retrieve current incident context. Please provide the incident number manually or escalate to senior support immediately."}]};
+    }
+}
+
+async function fetchLiveIncidentData(incidentNumber) {
+    /**Fetch the most current incident data from database and API*/
+    if (!incidentNumber || !db) return null;
+
+    try {
+        // Check MongoDB first
+        let incident = await db.collection('tickets').findOne(
+            { number: incidentNumber },
+            { sort: { updated_on: -1, created_on: -1 } }
+        );
+
+        if (!incident) {
+            incident = await db.collection('incidents').findOne(
+                { number: incidentNumber },
+                { sort: { updated_on: -1, created_on: -1 } }
+            );
+        }
+
+        // If found in DB, try to get even more recent data from ServiceNow API
+        if (incident) {
+            try {
+                const response = await axios.post(`${BACKEND_URL}/api/search_servicenow`,
+                    { "incident_number": incidentNumber },
+                    { timeout: 5000 }
+                );
+
+                if (response.status === 200 && response.data.incidents?.length > 0) {
+                    const apiIncident = response.data.incidents[0];
+                    // Use API data if it's newer
+                    const apiUpdateTime = new Date(apiIncident.updated_on || apiIncident.created_on);
+                    const dbUpdateTime = new Date(incident.updated_on || incident.created_on);
+
+                    if (apiUpdateTime > dbUpdateTime) {
+                        return apiIncident;
+                    }
+                }
+            } catch (apiError) {
+                console.log(`⚠️ ServiceNow API unavailable, using database data`);
+            }
+        }
+
+        return incident;
+    } catch (error) {
+        console.error(`❌ Error fetching live incident data: ${error}`);
+        return null;
+    }
+}
+
+async function getLatestCriticalIncidentForCall(callId) {
+    /**Get the latest critical incident if no specific context found*/
+    if (!db) return null;
+
+    try {
+        // Look for the most recent critical/high priority incidents
+        const criticalIncident = await db.collection('tickets').findOne(
+            {
+                priority: { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] },
+                state: { $nin: ['Resolved', 'Closed', 'Cancelled'] }
+            },
+            { sort: { created_on: -1 } }
+        );
+
+        if (!criticalIncident) {
+            const incident = await db.collection('incidents').findOne(
+                {
+                    priority: { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] },
+                    state: { $nin: ['Resolved', 'Closed', 'Cancelled'] }
+                },
+                { sort: { created_on: -1 } }
+            );
+            return incident ? { incident } : null;
+        }
+
+        return { incident: criticalIncident };
+    } catch (error) {
+        console.error(`❌ Error getting latest critical incident: ${error}`);
+        return null;
+    }
+}
+
+function calculateSLAStatus(incident) {
+    /**Calculate SLA status based on priority and creation time*/
+    if (!incident.created_on || !incident.priority) return null;
+
+    const created = new Date(incident.created_on);
+    const now = new Date();
+    const hoursElapsed = (now - created) / (1000 * 60 * 60);
+
+    let slaHours = 8; // Default
+    if (incident.priority.includes('1') || incident.priority.toLowerCase().includes('critical')) {
+        slaHours = 4;
+    } else if (incident.priority.includes('2') || incident.priority.toLowerCase().includes('high')) {
+        slaHours = 8;
+    }
+
+    const remainingHours = slaHours - hoursElapsed;
+
+    if (remainingHours <= 0) {
+        return `🚨 SLA BREACHED (${Math.abs(remainingHours).toFixed(1)} hours over)`;
+    } else if (remainingHours < 1) {
+        return `⚠️ CRITICAL - ${(remainingHours * 60).toFixed(0)} minutes remaining`;
+    } else {
+        return `✅ ${remainingHours.toFixed(1)} hours remaining`;
     }
 }
 
