@@ -94,7 +94,18 @@ async function findUserByPhone(phone) {
 
 // Store call context endpoint (called by ElevenLabs when call starts)
 async function storeCallContext(req, res) {
-    /**Store the calling number and incident context for this session*/
+    /**Store the calling number and incident context for this session with CORS support*/
+
+    // ✅ Add CORS headers for frontend access
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type');
+
+    // Handle preflight OPTIONS request
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+
     try {
         const data = req.body;
         const callerNumber = data.to_number;  // The number being called to
@@ -111,6 +122,9 @@ async function storeCallContext(req, res) {
             short_description: data.short_description
         };
 
+        console.log(`📞 Enhanced call context received for ${callId}:`, incidentContext);
+
+        // Store in memory for immediate access
         if (callerNumber) {
             // Find user by the number being called
             const user = await findUserByPhone(callerNumber);
@@ -127,10 +141,35 @@ async function storeCallContext(req, res) {
             }
         }
 
-        res.json({"status": "success"});
+        // Also store in database for persistence (enhanced feature)
+        if (db && incidentContext.incident_number) {
+            try {
+                await db.collection('call_contexts').replaceOne(
+                    { call_id: callId },
+                    {
+                        call_id: callId,
+                        caller_number: callerNumber,
+                        incident: incidentContext,
+                        timestamp: new Date(),
+                        status: 'active'
+                    },
+                    { upsert: true }
+                );
+                console.log(`✅ Enhanced call context stored in database for ${callId}`);
+            } catch (dbError) {
+                console.warn(`⚠️ Could not store in database: ${dbError}`);
+            }
+        }
+
+        res.json({
+            "status": "success",
+            "call_id": callId,
+            "incident_number": incidentContext.incident_number,
+            "enhanced": true
+        });
     } catch (error) {
         console.error(`❌ Error storing call context: ${error}`);
-        res.json({"status": "error"});
+        res.status(500).json({"status": "error", "message": error.toString()});
     }
 }
 

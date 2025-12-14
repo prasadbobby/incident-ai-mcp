@@ -49,13 +49,36 @@ module.exports = async (req, res) => {
                         console.log(`🎫 Incident context: ${incidentContext.incident_number} - ${incidentContext.short_description}`);
                     }
                 }
+
+                // ✅ Also store in database for persistence across serverless calls
+                if (incidentContext.incident_number) {
+                    await db.collection('call_contexts').replaceOne(
+                        { call_id: callId },
+                        {
+                            call_id: callId,
+                            caller_number: callerNumber,
+                            user: user,
+                            incident: incidentContext,
+                            timestamp: new Date(),
+                            status: 'active'
+                        },
+                        { upsert: true }
+                    );
+                    console.log(`✅ Enhanced call context stored in database for ${callId}`);
+                }
+
             } catch (dbError) {
                 console.error(`❌ Database error in call context: ${dbError}`);
                 // Continue without user lookup if database fails
             }
         }
 
-        res.status(200).json({"status": "success"});
+        res.status(200).json({
+            "status": "success",
+            "call_id": callId,
+            "incident_number": incidentContext.incident_number,
+            "enhanced": true
+        });
     } catch (error) {
         console.error(`❌ Error storing call context: ${error}`);
         res.status(500).json({"status": "error", "message": error.toString()});

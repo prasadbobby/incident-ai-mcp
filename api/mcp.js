@@ -8,42 +8,144 @@ const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:5000";
 
 // Tool implementations (imported from original mcp.js)
 async function getCurrentIncidentContext(toolArgs) {
+    /**Get the current incident context with auto-fetch from database*/
     const callId = toolArgs.call_id || 'default';
 
     try {
-        const session = currentCallSession[callId];
+        console.log(`🔍 Getting incident context for call ${callId}`);
 
+        // First check in-memory storage for backward compatibility
+        let session = currentCallSession[callId];
+
+        // If not in memory, fetch from database
         if (!session) {
-            return {"content": [{"type": "text", "text": "No active call session found. Please ensure the emergency call context is properly established."}]};
+            try {
+                const { db } = await connectToDatabase();
+                console.log(`🔍 No memory session found, checking database...`);
+
+                const callContext = await db.collection('call_contexts').findOne(
+                    { call_id: callId, status: 'active' },
+                    { sort: { timestamp: -1 } }
+                );
+
+                if (callContext) {
+                    session = {
+                        user: callContext.user,
+                        incident: callContext.incident,
+                        caller_number: callContext.caller_number
+                    };
+                    console.log(`📞 Retrieved call context from database for call ${callId}`);
+                }
+
+                // If still no session, automatically get latest incident from database
+                if (!session) {
+                    console.log(`🔍 No call context found, fetching latest incident from database...`);
+
+                    // Try to get latest critical incident first
+                    let latestIncident = await db.collection('processed_incidents').findOne(
+                        {
+                            $or: [
+                                { priority: { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] }},
+                                { 'sla_info.priority': { $in: ['1 - Critical', '2 - High', 'Critical', 'High', '1', '2'] }}
+                            ],
+                            status: { $nin: ['Resolved', 'Closed', 'Cancelled', 'completed'] }
+                        },
+                        { sort: { created_on: -1 } }
+                    );
+
+                    // If no critical incident, get any recent incident
+                    if (!latestIncident) {
+                        latestIncident = await db.collection('processed_incidents').findOne(
+                            {},
+                            { sort: { processing_timestamp: -1, created_on: -1 } }
+                        );
+                    }
+
+                    if (latestIncident) {
+                        console.log(`📋 Using latest incident: ${latestIncident.ticket_id}`);
+                        session = {
+                            incident: {
+                                number: latestIncident.ticket_id,
+                                ticket_id: latestIncident.ticket_id,
+                                incident_number: latestIncident.ticket_id,
+                                description: latestIncident.classification?.category || "Processed incident",
+                                priority: latestIncident.sla_info?.priority || "Medium",
+                                state: latestIncident.status || "Processed",
+                                assignment_group: latestIncident.assigned_poc || "Support Team",
+                                created_on: latestIncident.processing_timestamp,
+                                short_description: `${latestIncident.classification?.category} incident - ${latestIncident.assigned_poc}`
+                            }
+                        };
+                    }
+                }
+
+            } catch (dbError) {
+                console.error(`❌ Database error: ${dbError}`);
+            }
+        }
+
+        // Always try to provide some incident context
+        if (!session || !session.incident) {
+            console.log(`⚠️ No incident found, using basic context for emergency call`);
+            // Generate a basic context for the call
+            session = {
+                incident: {
+                    number: `ESCALATION-${Date.now()}`,
+                    incident_number: `ESCALATION-${Date.now()}`,
+                    description: "Critical incident escalation call initiated",
+                    priority: "High",
+                    state: "New",
+                    created_on: new Date().toISOString(),
+                    short_description: "Emergency support call"
+                }
+            };
         }
 
         const user = session.user;
         const incident = session.incident;
 
-        let responseText = "🚨 **CURRENT EMERGENCY CALL CONTEXT:**\n\n";
+        // Determine response type based on how incident was found
+        let responseHeader = "🚨 **LIVE EMERGENCY CALL CONTEXT:**\n\n";
+        let contextSource = "";
+
+        if (incident.number && incident.number.startsWith('ESCALATION-')) {
+            responseHeader = "🚨 **EMERGENCY ESCALATION CALL:**\n\n";
+            contextSource = "📞 **CALL TYPE:** General emergency escalation\n";
+        } else if (incident.ticket_id) {
+            responseHeader = "🚨 **LATEST INCIDENT ESCALATION:**\n\n";
+            contextSource = "📋 **CONTEXT:** Latest incident from database\n";
+        } else {
+            contextSource = "📞 **CALL STATUS:** Active incident escalation\n";
+        }
+
+        let responseText = responseHeader + contextSource + "\n";
 
         // User context
         if (user) {
-            responseText += `👤 **CALLER:** ${user.full_name}\n`;
+            responseText += `👤 **EMERGENCY CONTACT:** ${user.full_name}\n`;
             responseText += `📞 **PHONE:** ${user.phone}\n`;
             responseText += `📧 **EMAIL:** ${user.email}\n`;
             responseText += `🎭 **ROLE:** ${user.role}\n\n`;
         }
 
-        // Incident context
-        if (incident && incident.incident_number) {
-            responseText += `🎫 **INCIDENT NUMBER:** ${incident.incident_number}\n`;
+        // Real-time incident context
+        if (incident) {
+            const incidentNumber = incident.number || incident.incident_number || incident.ticket_id;
+
+            responseText += `🎫 **INCIDENT NUMBER:** ${incidentNumber}\n`;
 
             if (incident.short_description) {
                 responseText += `📋 **DESCRIPTION:** ${incident.short_description}\n`;
             }
 
             if (incident.priority) {
-                responseText += `⚡ **PRIORITY:** ${incident.priority}\n`;
+                const priority = incident.priority;
+                const priorityEmoji = priority.includes('1') || priority.toLowerCase().includes('critical') ? '🚨' : '⚡';
+                responseText += `${priorityEmoji} **PRIORITY:** ${priority}\n`;
             }
 
             if (incident.state) {
-                responseText += `🎯 **STATUS:** ${incident.state}\n`;
+                responseText += `🎯 **CURRENT STATUS:** ${incident.state}\n`;
             }
 
             if (incident.assignment_group) {
@@ -54,17 +156,25 @@ async function getCurrentIncidentContext(toolArgs) {
                 responseText += `📅 **CREATED:** ${incident.created_on}\n`;
             }
 
-            responseText += "\n🔄 **EMERGENCY SUPPORT:** This is your selected critical incident. I can provide status updates, resolution procedures, or execute emergency scripts for this incident.";
+            // Add context-specific support message
+            if (incident.number && incident.number.startsWith('ESCALATION-')) {
+                responseText += "\n🔄 **EMERGENCY SUPPORT:** I'm ready to assist with this escalation. I can help find specific incidents, provide resolution procedures, or execute emergency scripts.";
+            } else if (incident.ticket_id) {
+                responseText += "\n🔄 **LIVE INCIDENT SUPPORT:** I have the latest incident from your database. I can provide status updates, resolution procedures, or execute emergency scripts for this incident.";
+                responseText += "\n✅ **DATABASE INTEGRATION:** Using most recent incident data automatically.";
+            } else {
+                responseText += "\n🔄 **LIVE EMERGENCY SUPPORT:** I have the current incident data. I can provide real-time status updates, resolution procedures, or execute emergency scripts immediately.";
+            }
         } else {
-            responseText += "⚠️ **NO INCIDENT SELECTED:** No specific incident context found for this call. ";
-            responseText += "Please provide the incident number or select an incident for emergency support.";
+            responseText += "⚠️ **NO INCIDENT CONTEXT:** No specific incident found for this emergency call. ";
+            responseText += "I can help you find critical incidents or provide the incident number for immediate escalation support.";
         }
 
         return {"content": [{"type": "text", "text": responseText}]};
 
     } catch (error) {
         console.error(`❌ Error getting current incident context: ${error}`);
-        return {"content": [{"type": "text", "text": "🚨 **ERROR:** Unable to retrieve current incident context. Please try again or provide the incident number manually."}]};
+        return {"content": [{"type": "text", "text": "🚨 **EMERGENCY SYSTEM ERROR:** Unable to retrieve current incident context. Please provide the incident number manually or escalate to senior support immediately."}]};
     }
 }
 

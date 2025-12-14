@@ -29,10 +29,14 @@ module.exports = async (req, res) => {
         try {
             const { db } = await connectToDatabase();
 
-            // Check multiple possible collection names for tickets/incidents
+            // ✅ Check actual collection names in your database
+            const processedIncidentsCount = await db.collection('processed_incidents').countDocuments({});
             const ticketsCount = await db.collection('tickets').countDocuments({});
             const incidentsCount = await db.collection('incidents').countDocuments({});
             const usersCount = await db.collection('users').countDocuments({});
+            const generatedSopsCount = await db.collection('generated_sops').countDocuments({});
+            const activitiesCount = await db.collection('activities').countDocuments({});
+            const callContextsCount = await db.collection('call_contexts').countDocuments({});
 
             // List all collections to help debug
             const collections = await db.listCollections().toArray();
@@ -42,15 +46,23 @@ module.exports = async (req, res) => {
                 connected: true,
                 collections: collectionNames,
                 counts: {
+                    processed_incidents: processedIncidentsCount,
                     tickets: ticketsCount,
                     incidents: incidentsCount,
-                    users: usersCount
+                    users: usersCount,
+                    generated_sops: generatedSopsCount,
+                    activities: activitiesCount,
+                    call_contexts: callContextsCount
                 }
             };
 
-            // Maintain backward compatibility
-            healthData.tickets = ticketsCount + incidentsCount;
+            // ✅ Maintain backward compatibility - count all incident-related collections
+            const totalIncidents = processedIncidentsCount + ticketsCount + incidentsCount;
+            healthData.tickets = totalIncidents;
             healthData.users = usersCount;
+
+            console.log(`📊 Health Check - Total incidents: ${totalIncidents} (${processedIncidentsCount} processed + ${ticketsCount} tickets + ${incidentsCount} incidents)`);
+            console.log(`👥 Users: ${usersCount}, SOPs: ${generatedSopsCount}, Activities: ${activitiesCount}`);
         } catch (dbError) {
             console.error(`❌ Database query error: ${dbError}`);
             healthData.database = {
