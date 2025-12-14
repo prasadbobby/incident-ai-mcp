@@ -19,7 +19,7 @@
     {
       "src": "/call-context",
       "dest": "/api/call-context.js",
-      "methods": ["POST"]
+      "methods": ["POST", "OPTIONS"]
     },
     {
       "src": "/mcp",

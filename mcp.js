@@ -415,10 +415,15 @@ async function getCurrentIncidentContext(toolArgs) {
         let responseHeader = "🚨 **LIVE EMERGENCY CALL CONTEXT:**\n\n";
         let contextSource = "";
 
-        if (incident.number && incident.number.startsWith('ESCALATION-')) {
+        const incidentNumber = incident.number || incident.incident_number || incident.ticket_id || '';
+
+        if (incidentNumber && incidentNumber.toString().startsWith('ESCALATION-')) {
             responseHeader = "🚨 **EMERGENCY ESCALATION CALL:**\n\n";
             contextSource = "📞 **CALL TYPE:** General emergency escalation\n";
-        } else if (incident.ticket_id) {
+        } else if (incidentNumber && incidentNumber.toString().startsWith('INC')) {
+            responseHeader = "🚨 **LIVE INCIDENT ESCALATION:**\n\n";
+            contextSource = "📋 **CONTEXT:** ServiceNow incident from database\n";
+        } else if (incident.ticket_id || incidentNumber) {
             responseHeader = "🚨 **LATEST INCIDENT ESCALATION:**\n\n";
             contextSource = "📋 **CONTEXT:** Latest incident from database\n";
         } else {
@@ -480,9 +485,12 @@ async function getCurrentIncidentContext(toolArgs) {
             }
 
             // Add context-specific support message
-            if (incident.number && incident.number.startsWith('ESCALATION-')) {
+            if (incidentNumber && incidentNumber.toString().startsWith('ESCALATION-')) {
                 responseText += "\n🔄 **EMERGENCY SUPPORT:** I'm ready to assist with this escalation. I can help find specific incidents, provide resolution procedures, or execute emergency scripts.";
-            } else if (incident.ticket_id) {
+            } else if (incidentNumber && incidentNumber.toString().startsWith('INC')) {
+                responseText += "\n🔄 **LIVE SERVICENOW INCIDENT:** I have the ServiceNow incident from your database. I can provide status updates, resolution procedures, or execute emergency scripts for this incident.";
+                responseText += "\n✅ **REAL-TIME DATA:** Using live ServiceNow incident data automatically.";
+            } else if (incident.ticket_id || incidentNumber) {
                 responseText += "\n🔄 **LIVE INCIDENT SUPPORT:** I have the latest incident from your database. I can provide status updates, resolution procedures, or execute emergency scripts for this incident.";
                 responseText += "\n✅ **DATABASE INTEGRATION:** Using most recent incident data automatically.";
             } else {
@@ -623,26 +631,29 @@ async function getLatestIncidentFromDatabase() {
         );
 
         if (latestIncident) {
-            // ✅ Smart field mapping - try multiple possible field names
-            const incidentId = latestIncident.ticket_id || latestIncident._id || latestIncident.id ||
-                             latestIncident.number || latestIncident.incident_id ||
-                             `PROC-${Date.now()}`;
+            // ✅ Handle nested incident_data structure
+            const incidentData = latestIncident.incident_data || latestIncident;
 
-            const description = latestIncident.description || latestIncident.short_description ||
-                              latestIncident.classification?.category || latestIncident.category ||
+            // ✅ Smart field mapping - try multiple possible field names
+            const incidentId = incidentData.number || incidentData.ticket_id ||
+                             latestIncident._id?.toString() || latestIncident.id ||
+                             incidentData.incident_id || `PROC-${Date.now()}`;
+
+            const description = incidentData.description || incidentData.short_description ||
+                              latestIncident.classification?.category || incidentData.category ||
                               "Processed incident";
 
-            const priority = latestIncident.priority || latestIncident.sla_info?.priority ||
-                           latestIncident.urgency || "Medium";
+            const priority = incidentData.priority || latestIncident.sla_info?.priority ||
+                           incidentData.urgency || "Medium";
 
-            const status = latestIncident.status || latestIncident.state ||
-                         latestIncident.incident_state || "Processed";
+            const status = latestIncident.status || incidentData.state ||
+                         incidentData.incident_state || "Processed";
 
-            const assignedTo = latestIncident.assigned_poc || latestIncident.assigned_to ||
-                             latestIncident.assignment_group || "Support Team";
+            const assignedTo = incidentData.assignment_group || latestIncident.assigned_poc ||
+                             incidentData.assigned_to || "Support Team";
 
-            const createdDate = latestIncident.processing_timestamp || latestIncident.created_on ||
-                              latestIncident.created_at || latestIncident.timestamp ||
+            const createdDate = incidentData.created_on || latestIncident.processed_at ||
+                              incidentData.created_at || latestIncident.processing_timestamp ||
                               new Date().toISOString();
 
             console.log(`📋 Found incident in processed_incidents: ${incidentId}`);
@@ -654,7 +665,7 @@ async function getLatestIncidentFromDatabase() {
                 state: status,
                 assignment_group: assignedTo,
                 created_on: createdDate,
-                short_description: `${description.substring(0, 50)} - ${assignedTo}`
+                short_description: `${description.substring(0, 50)}` + (assignedTo ? ` - ${assignedTo}` : '')
             };
         }
 
